@@ -14,7 +14,7 @@ from functools import reduce
 import random
 
 
-nu_version = 'v1.0-trainval'
+nu_version = 'v1.0-mini'
 renusc = NuScenes(version=nu_version, dataroot=str('data/nuscenes/'), verbose=False)
 
 @DATASETS.register_module()
