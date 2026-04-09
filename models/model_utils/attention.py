@@ -3,10 +3,11 @@
 # ------------------------------------------------------------------------
 #  Modified by Shihao Wang
 # ------------------------------------------------------------------------
-# flash-attention 
+# flash-attention replaced with torch SDPA (compatible with Python 3.8 + PyTorch 2.0)
 import math
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.nn.init import (
     xavier_uniform_,
     constant_,
@@ -17,9 +18,6 @@ from torch.nn.functional import linear
 from einops import rearrange
 from mmcv.runner import auto_fp16
 from mmcv.runner.base_module import BaseModule
-
-from flash_attn.flash_attn_interface import flash_attn_unpadded_kvpacked_func
-from flash_attn.bert_padding import unpad_input, pad_input, index_first_axis
 
 
 def _in_projection_packed(q, k, v, w, b = None):
@@ -32,7 +30,7 @@ def _in_projection_packed(q, k, v, w, b = None):
 
 
 class FlashAttention(nn.Module):
-    """Implement the scaled dot product attention with softmax.
+    """Scaled dot product attention using torch.nn.functional.scaled_dot_product_attention.
     Arguments
     ---------
         softmax_scale: The temperature to use for the softmax attention.
@@ -48,51 +46,44 @@ class FlashAttention(nn.Module):
         self.fp16_enabled = True
 
     @auto_fp16(apply_to=('q', 'kv'), out_fp32=True)
-    def forward(self, q, kv, 
-                causal=False, 
+    def forward(self, q, kv,
+                causal=False,
                 key_padding_mask=None):
         """Implements the multihead softmax attention.
         Arguments
         ---------
-            q: The tensor containing the query. (B, T, H, D) 
-            kv: The tensor containing the key, and value. (B, S, 2, H, D) 
+            q: The tensor containing the query. (B, T, H, D)
+            kv: The tensor containing the key, and value. (B, S, 2, H, D)
             key_padding_mask: a bool tensor of shape (B, S)
         """
-        assert q.dtype in [torch.float16, torch.bfloat16] and kv.dtype in [torch.float16, torch.bfloat16]
         assert q.is_cuda and kv.is_cuda
         assert q.shape[0] == kv.shape[0] and q.shape[-2] == kv.shape[-2] and q.shape[-1] == kv.shape[-1]
 
-        batch_size = q.shape[0]
-        seqlen_q, seqlen_k = q.shape[1], kv.shape[1]
-        if key_padding_mask is None:
-            q, kv = rearrange(q, 'b s ... -> (b s) ...'), rearrange(kv, 'b s ... -> (b s) ...')
-            max_sq, max_sk = seqlen_q, seqlen_k 
-            cu_seqlens_q = torch.arange(0, (batch_size + 1) * seqlen_q, step=seqlen_q, dtype=torch.int32,
-                                    device=q.device)
-            cu_seqlens_k = torch.arange(0, (batch_size + 1) * seqlen_k, step=seqlen_k, dtype=torch.int32,
-                                    device=kv.device)                    
-            output = flash_attn_unpadded_kvpacked_func(
-                q, kv, cu_seqlens_q, cu_seqlens_k, max_sq, max_sk,
-                self.dropout_p if self.training else 0.0,
-                softmax_scale=self.softmax_scale, causal=causal
-            )
-            output = rearrange(output, '(b s) ... -> b s ...', b=batch_size)
-        else:
-            nheads = kv.shape[-2]
-            q = rearrange(q, 'b s ... -> (b s) ...')
-            max_sq = seqlen_q
-            cu_seqlens_q = torch.arange(0, (batch_size + 1) * seqlen_q, step=seqlen_q, dtype=torch.int32,
-                                    device=q.device)
-            x = rearrange(kv, 'b s two h d -> b s (two h d)')
-            x_unpad, indices, cu_seqlens_k, max_sk = unpad_input(x, key_padding_mask)
-            x_unpad = rearrange(x_unpad, 'nnz (two h d) -> nnz two h d', two=2, h=nheads)
-            output_unpad = flash_attn_unpadded_kvpacked_func(
-                q, x_unpad, cu_seqlens_q, cu_seqlens_k, max_sq, max_sk,
-                self.dropout_p if self.training else 0.0,
-                softmax_scale=self.softmax_scale, causal=causal
-            )
-            output = rearrange(output_unpad, '(b s) ... -> b s ...', b=batch_size)
+        # kv: (B, S, 2, H, D) -> k, v: (B, S, H, D)
+        k = kv[:, :, 0]
+        v = kv[:, :, 1]
 
+        # (B, S, H, D) -> (B, H, S, D) for SDPA
+        q = rearrange(q, 'b t h d -> b h t d')
+        k = rearrange(k, 'b s h d -> b h s d')
+        v = rearrange(v, 'b s h d -> b h s d')
+
+        attn_mask = None
+        if key_padding_mask is not None:
+            # key_padding_mask: (B, S), True = valid position
+            # SDPA attn_mask: (B, 1, 1, S), True = attend, False = ignore
+            attn_mask = key_padding_mask[:, None, None, :]  # (B, 1, 1, S)
+
+        output = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=attn_mask,
+            dropout_p=self.dropout_p if self.training else 0.0,
+            scale=self.softmax_scale,
+            is_causal=causal if key_padding_mask is None else False,
+        )
+
+        # (B, H, T, D) -> (B, T, H, D)
+        output = rearrange(output, 'b h t d -> b t h d')
         return output, None
 
 
