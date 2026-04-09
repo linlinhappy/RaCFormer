@@ -455,8 +455,20 @@ def render_sample_data(
     plt.close()
 
 if __name__ == '__main__':
-    nusc = NuScenes(version='v1.0-trainval', dataroot='./data/nuscenes', verbose=True)
-    results = mmcv.load('submission/pts_bbox/r50_f8_results_nusc.json')
+    import os, argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--result', default='submission/pts_bbox/results_nusc.json')
+    parser.add_argument('--out-dir', default='./visual_outputs')
+    parser.add_argument('--version', default='v1.0-mini')
+    parser.add_argument('--dataroot', default='./data/nuscenes')
+    parser.add_argument('--num-samples', type=int, default=10)
+    args = parser.parse_args()
+
+    os.makedirs(args.out_dir, exist_ok=True)
+    nusc = NuScenes(version=args.version, dataroot=args.dataroot, verbose=True)
+    results = mmcv.load(args.result)
     sample_token_list = list(results['results'].keys())
-    for id in range(0, 6019):
-        render_sample_data(sample_token_list[id], pred_data=results, out_path='./visual_outputs/'+str(sample_token_list[id]))
+    for id in range(min(args.num_samples, len(sample_token_list))):
+        print(f'Rendering {id+1}/{min(args.num_samples, len(sample_token_list))} ...')
+        render_sample_data(sample_token_list[id], pred_data=results,
+                           out_path=os.path.join(args.out_dir, str(sample_token_list[id])))
