@@ -461,7 +461,7 @@ if __name__ == '__main__':
     parser.add_argument('--out-dir', default='./visual_outputs')
     parser.add_argument('--version', default='v1.0-mini')
     parser.add_argument('--dataroot', default='./data/nuscenes')
-    parser.add_argument('--num-samples', type=int, default=10)
+    parser.add_argument('--num-samples', type=int, default=20)
     args = parser.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
