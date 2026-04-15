@@ -24,8 +24,8 @@ import numpy as np
 import torch
 import traceback
 
-INPUT_DIR  = pathlib.Path('/workspace/ros_input')
-OUTPUT_DIR = pathlib.Path('/workspace/ros_output')
+_DEFAULT_INPUT_DIR  = pathlib.Path('/workspace/ros_input')
+_DEFAULT_OUTPUT_DIR = pathlib.Path('/workspace/ros_output')
 
 TARGET_H, TARGET_W = 256, 704
 NUM_CAMS   = 6
@@ -199,7 +199,16 @@ def main():
     parser.add_argument('--weights',
         default='/workspace/checkpoints/racformer_r50_f8.pth')
     parser.add_argument('--poll_interval', type=float, default=0.05)
+    parser.add_argument('--input_dir',  type=pathlib.Path,
+        default=_DEFAULT_INPUT_DIR,
+        help='Directory to watch for frame_*.npz (default: /workspace/ros_input)')
+    parser.add_argument('--output_dir', type=pathlib.Path,
+        default=_DEFAULT_OUTPUT_DIR,
+        help='Directory to write JSON results (default: /workspace/ros_output)')
     args = parser.parse_args()
+
+    INPUT_DIR  = args.input_dir
+    OUTPUT_DIR = args.output_dir
 
     logging.basicConfig(level=logging.INFO,
                         format='%(asctime)s %(levelname)s %(message)s')
