@@ -18,6 +18,7 @@ import importlib
 import json
 import logging
 import pathlib
+import signal
 import time
 
 import numpy as np
@@ -103,7 +104,11 @@ def load_model(config_path: str, weights_path: str):
 # ---------------------------------------------------------------------------
 @torch.no_grad()
 def run_inference(model, npz_path: pathlib.Path) -> dict:
+    # [計時區間 1: load] t_load_start → t_load_end
+    #   涵蓋範圍: np.load() 讀取 .npz 檔案（磁碟 I/O + numpy 反序列化）
+    t_load_start = time.perf_counter()
     data = np.load(str(npz_path), allow_pickle=True)
+    t_load_end = time.perf_counter()
 
     imgs           = data['imgs']            # (8, 6, 3, 256, 704)
     lidar2img_np   = data['lidar2img']       # (8, 6, 4, 4)
@@ -150,6 +155,11 @@ def run_inference(model, npz_path: pathlib.Path) -> dict:
     radar_pts_per_frame = [radar_pts_t]          # batch list (B=1) for one frame
     radar_points_all = [radar_pts_per_frame] * NUM_FRAMES  # T=8 frames
 
+    # [計時區間 2: forward] t_forward_start → t_forward_end
+    #   涵蓋範圍: model.simple_test()（GPU forward pass）+ cuda synchronize
+    #   cuda.synchronize() 確保 GPU 工作完成後才取結束時間，
+    #   避免因 CUDA 非同步執行造成計時偏低
+    t_forward_start = time.perf_counter()
     results = model.simple_test(
         img_metas=img_metas,
         img=img_tensor,
@@ -157,6 +167,8 @@ def run_inference(model, npz_path: pathlib.Path) -> dict:
         radar_depth=radar_depth,
         radar_rcs=radar_rcs,
     )
+    torch.cuda.synchronize()
+    t_forward_end = time.perf_counter()
 
     detections = []
     pts_bbox = results[0].get('pts_bbox', {})
@@ -186,7 +198,20 @@ def run_inference(model, npz_path: pathlib.Path) -> dict:
                 'class': NUSCENES_CLASSES[int(labels_np[j])],
             })
 
-    return {'timestamp': frame_ts, 'detections': detections}
+    # 兩段計時差值轉換為毫秒（× 1000）
+    # load_ms    = 區間 1 (npz 讀取)  的耗時
+    # forward_ms = 區間 2 (模型推論) 的耗時
+    load_ms    = (t_load_end    - t_load_start)  * 1000
+    forward_ms = (t_forward_end - t_forward_start) * 1000
+
+    return {
+        'timestamp':  frame_ts,
+        'detections': detections,
+        'timing_ms': {
+            'load':    round(load_ms,    2),
+            'forward': round(forward_ms, 2),
+        },
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -226,6 +251,14 @@ def main():
     logging.info('Watching %s', INPUT_DIR)
 
     processed: set[str] = set()
+    forward_times_ms: list[float] = []
+
+    def _shutdown(*_):
+        _write_timing_report(forward_times_ms)
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGINT,  _shutdown)
+    signal.signal(signal.SIGTERM, _shutdown)
 
     while True:
         pending = sorted(INPUT_DIR.glob('frame_*.npz'))
@@ -251,8 +284,12 @@ def main():
                     result = run_inference(model, latest_npz)
                     out = OUTPUT_DIR / latest_npz.name.replace('.npz', '.json')
                     out.write_text(json.dumps(result))
-                    logging.info('frame %s → %d detections',
-                                 latest_npz.stem, len(result['detections']))
+                    fwd_ms = result['timing_ms']['forward']
+                    forward_times_ms.append(fwd_ms)
+                    avg_ms = sum(forward_times_ms) / len(forward_times_ms)
+                    logging.info('frame %s → %d detections | forward %.1f ms | avg %.1f ms (n=%d)',
+                                 latest_npz.stem, len(result['detections']),
+                                 fwd_ms, avg_ms, len(forward_times_ms))
                 except Exception:
                     logging.error('Error on %s:\n%s', latest_npz.name, traceback.format_exc())
                 finally:
@@ -266,6 +303,25 @@ def main():
             processed = set(list(processed)[-200:])
 
         time.sleep(args.poll_interval)
+
+
+def _write_timing_report(forward_times_ms: list[float]) -> None:
+    report_path = pathlib.Path('/workspace/inference_timing_report.json')
+    n = len(forward_times_ms)
+    if n == 0:
+        report = {'frames_processed': 0}
+    else:
+        report = {
+            'frames_processed': n,
+            'forward_ms': {
+                'mean':   round(sum(forward_times_ms) / n, 2),
+                'min':    round(min(forward_times_ms), 2),
+                'max':    round(max(forward_times_ms), 2),
+                'all':    [round(v, 2) for v in forward_times_ms],
+            },
+        }
+    report_path.write_text(json.dumps(report, indent=2))
+    logging.info('Timing report written to %s', report_path)
 
 
 if __name__ == '__main__':
